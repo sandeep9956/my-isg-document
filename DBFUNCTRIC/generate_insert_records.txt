@@ -1,0 +1,201 @@
+-- FUNCTION: public.generate_insert_records(text, refcursor, text[], text[])
+
+-- DROP FUNCTION IF EXISTS public.generate_insert_records(text, refcursor, text[], text[]);
+
+CREATE OR REPLACE FUNCTION public.generate_insert_records(
+	p_tablename text,
+	refcurinsertrecords refcursor,
+	p_ignore_cols text[] DEFAULT NULL::text[],
+	p_order_specs text[] DEFAULT NULL::text[])
+    RETURNS SETOF refcursor 
+    LANGUAGE 'plpgsql'
+    COST 100
+    VOLATILE PARALLEL UNSAFE
+    ROWS 1000
+
+AS $BODY$
+DECLARE
+    sql_query           text;
+    ignore_filter       text := '';
+    schema_name         text;
+    table_name_only     text;
+
+    -- For multi-order construction
+    spec                text;
+    spec_trim           text;
+    order_col           text;
+    order_dir           text;
+    order_col_type      text;
+    i                   int := 1;
+
+    ordkey_selects_core text := '';           -- "expr1 AS ordkey1, expr2 AS ordkey2"
+    ordkey_selects_pref text := '';           -- ", expr1 AS ordkey1, ..." (only if not empty)
+    order_terms         text := 'ctid';       -- outer ORDER BY (prepend ordkeys)
+    group_by_ordkeys    text := '';           -- ", ordkey1, ordkey2" (only if not empty)
+BEGIN
+    -- Resolve schema.table
+    IF position('.' IN p_tablename) > 0 THEN
+        schema_name := split_part(p_tablename, '.', 1);
+        table_name_only := split_part(p_tablename, '.', 2);
+    ELSE
+        SELECT table_schema INTO schema_name
+        FROM information_schema.tables
+        WHERE table_name = p_tablename
+        LIMIT 1;
+        IF schema_name IS NULL THEN schema_name := 'public'; END IF;
+        table_name_only := p_tablename;
+    END IF;
+
+    -- Ignore list
+    IF p_ignore_cols IS NOT NULL AND array_length(p_ignore_cols,1) > 0 THEN
+        ignore_filter := 'AND c.column_name NOT IN (' ||
+            array_to_string(ARRAY(SELECT quote_literal(x) FROM unnest(p_ignore_cols) AS x), ', ') || ')';
+    END IF;
+
+    -- Build multi-ORDER BY: ordkey1..N + outer ORDER BY terms
+    IF p_order_specs IS NOT NULL AND array_length(p_order_specs,1) > 0 THEN
+        FOR spec IN SELECT unnest(p_order_specs)
+        LOOP
+            spec_trim := btrim(spec);
+            IF spec_trim IS NULL OR spec_trim = '' THEN
+                CONTINUE;
+            END IF;
+
+            -- first token = column, remainder = direction (optional)
+            order_col := split_part(spec_trim, ' ', 1);
+            order_dir := btrim(regexp_replace(spec_trim, '^[^ ]+\s*', ''));  -- remainder after first token
+            order_dir := upper(NULLIF(order_dir, ''));
+            IF order_dir IS NULL OR order_dir NOT IN ('ASC','DESC') THEN
+                order_dir := 'ASC';
+            END IF;
+
+            -- Look up column type
+            SELECT data_type INTO order_col_type
+            FROM information_schema.columns
+            WHERE table_schema = schema_name
+              AND table_name   = table_name_only
+              AND column_name  = order_col;
+
+            -- Build typed expression for this ordkey
+            IF order_col_type IN ('smallint','integer','bigint','numeric','real','double precision','decimal') THEN
+                ordkey_selects_core := ordkey_selects_core ||
+                    CASE WHEN ordkey_selects_core = '' THEN '' ELSE ', ' END ||
+                    'NULLIF(b.rv->>' || quote_literal(order_col) || ', '''')::numeric AS ordkey' || i;
+            ELSIF order_col_type = 'boolean' THEN
+                ordkey_selects_core := ordkey_selects_core ||
+                    CASE WHEN ordkey_selects_core = '' THEN '' ELSE ', ' END ||
+                    '(b.rv->>' || quote_literal(order_col) || ')::boolean AS ordkey' || i;
+            ELSIF order_col_type = 'date' THEN
+                ordkey_selects_core := ordkey_selects_core ||
+                    CASE WHEN ordkey_selects_core = '' THEN '' ELSE ', ' END ||
+                    '(b.rv->>' || quote_literal(order_col) || ')::date AS ordkey' || i;
+            ELSIF order_col_type = 'timestamp without time zone' THEN
+                ordkey_selects_core := ordkey_selects_core ||
+                    CASE WHEN ordkey_selects_core = '' THEN '' ELSE ', ' END ||
+                    '(b.rv->>' || quote_literal(order_col) || ')::timestamp without time zone AS ordkey' || i;
+            ELSIF order_col_type = 'timestamp with time zone' THEN
+                ordkey_selects_core := ordkey_selects_core ||
+                    CASE WHEN ordkey_selects_core = '' THEN '' ELSE ', ' END ||
+                    '(b.rv->>' || quote_literal(order_col) || ')::timestamp with time zone AS ordkey' || i;
+            ELSE
+                -- text fallback
+                ordkey_selects_core := ordkey_selects_core ||
+                    CASE WHEN ordkey_selects_core = '' THEN '' ELSE ', ' END ||
+                    'b.rv->>' || quote_literal(order_col) || ' AS ordkey' || i;
+            END IF;
+
+            -- GROUP BY additions
+            group_by_ordkeys := group_by_ordkeys || ', ordkey' || i;
+
+            -- ORDER BY terms (direction is always non-NULL here)
+            order_terms := 'ordkey' || i || ' ' || order_dir || ' NULLS LAST, ' || order_terms;
+
+            i := i + 1;
+        END LOOP;
+
+        -- Only add leading comma to the SELECT list if we actually have ordkeys
+        IF ordkey_selects_core <> '' THEN
+            ordkey_selects_pref := ', ' || ordkey_selects_core;
+        END IF;
+    END IF;
+
+    -- Build SQL using CTEs; compute per-row INSERT + ordkeys, order outside
+    sql_query := format(
+        $f$
+        WITH base AS (
+            SELECT
+                t.ctid,
+                row_to_json(t) AS rv
+            FROM %I.%I t
+        ),
+        cols AS (
+            SELECT column_name, data_type, ordinal_position
+            FROM information_schema.columns c
+            WHERE c.table_schema = %L
+              AND c.table_name   = %L
+              %s
+            ORDER BY ordinal_position
+        ),
+        per_row AS (
+            SELECT
+                b.ctid%s,
+                'INSERT INTO %I.%I (' ||
+                string_agg(quote_ident(c.column_name), ', ' ORDER BY c.ordinal_position) ||
+                ') VALUES (' ||
+                string_agg(
+                    CASE
+                      WHEN c.data_type IN (
+                        'character varying','character','text','citext',
+                        'uuid','date',
+                        'timestamp without time zone','timestamp with time zone',
+                        'time without time zone','time with time zone',
+                        'json','jsonb','bytea','inet','macaddr','macaddr8','xml'
+                      )
+                        THEN quote_nullable(b.rv->>c.column_name)
+                      WHEN c.data_type IN ('boolean')
+                        THEN COALESCE(b.rv->>c.column_name, 'NULL')
+                      ELSE
+                        COALESCE(NULLIF(b.rv->>c.column_name,''), 'NULL')
+                    END,
+                    ', ' ORDER BY c.ordinal_position
+                ) ||
+                ');' AS ins
+            FROM base b
+            CROSS JOIN cols c
+            GROUP BY b.ctid%s
+        )
+        SELECT ins
+        FROM per_row
+        ORDER BY %s
+        $f$,
+        -- table
+        schema_name, table_name_only,
+        -- info schema filters
+        schema_name, table_name_only,
+        -- ignore filter
+        ignore_filter,
+        -- ordkey selects (leading comma only when present)
+        ordkey_selects_pref,
+        -- INSERT INTO
+        schema_name, table_name_only,
+        -- GROUP BY additions (leading comma only when present)
+        group_by_ordkeys,
+        -- ORDER BY list (always non-NULL)
+        order_terms
+    );
+
+    RAISE NOTICE 'SQL: %', sql_query;
+
+    OPEN refcurinsertrecords FOR EXECUTE sql_query;
+    RETURN NEXT refcurinsertrecords;
+END;
+$BODY$;
+
+ALTER FUNCTION public.generate_insert_records(text, refcursor, text[], text[])
+    OWNER TO postgres;
+---------------------------------------------------------------------------------------------------------------------------------
+SELECT public.generate_insert_records(
+    'public.user_login',
+    'my_cursor'
+);
+FETCH ALL FROM my_cursor;
